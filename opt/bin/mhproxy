@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+
+from dotenv import load_dotenv
+import argparse
+import os
+import sys
+import json
+import time
+import string
+import random
+import re
+from urllib.parse import urlparse
+import logging
+import datetime
+import ssl
+import shutil
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+
+
+def is_valid_url(url):
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+
+def extract_url_components(url):
+    if not is_valid_url(url):
+        url = "http://" + url
+        if not is_valid_url(url):
+            logging.info("invalid url")
+            sys.exit(1)
+     
+    parsed_url = urlparse(url)
+    protocol = parsed_url.scheme
+
+    # default protocol is http
+    if protocol == "" or protocol is None:
+        protocol = "http"
+        parsed_url = urlparse(f"http://{url}")
+    
+    # default ports are 80 and 443
+    port = parsed_url.port
+    if port is None:
+        port = 80 if protocol == "http" else 443
+
+    dnsloc = parsed_url.netloc
+    dnsloc = dnsloc.split(":")[0]
+    path = parsed_url.path
+    url = f"{protocol}://{dnsloc}:{port}/{path}"
+    return protocol, dnsloc, port, path, url
+
+
+def is_valid_email(email):
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return re.match(pattern, email) is not None
+
+
+def get_certpath(url):
+    if is_valid_url(url):
+        _, dnsloc, _, _, _ = extract_url_components(url)
+        return os.path.join(denv["lb_etc"], "certs", dnsloc + "_combined.pem")
+    else:
+        logging.info("invalid url for ssl")
+        sys.exit(1)
+
+
+def get_lock_path():
+    return os.path.join(denv["var"], ".lock")
+
+
+def lock():
+    # Function that locks the ability to change load balance configuration
+    filepath = get_lock_path()
+    mykey = "".join(random.choice(string.ascii_lowercase) for i in range(10))
+    wait_lock()
+    with open(filepath, "w") as f:
+        f.write(mykey)
+    return mykey
+
+
+def unlock(mykey):
+    # Function that allows the change of the load balance configuration
+    filepath = get_lock_path()
+    if os.path.isfile(filepath):
+        with open(filepath, "r") as f:
+            if f.read() == mykey:
+                os.remove(filepath)
+
+
+def force_unlock():
+    # Function that removes the lock file
+    filepath = get_lock_path()
+    os.remove(filepath)
+    logging.info("removed file lock")
+
+
+def is_locked():
+    # Function that checks load balancer lock status
+    filepath = get_lock_path()
+    return os.path.isfile(filepath)
+
+
+def wait_lock():
+    # Function that waits until the file lock is unlocked.
+    for n in range(denv["retries"]):
+        if not is_locked():
+            return
+        time.sleep(denv["sleep"])
+    
+    logging.info("file lock time out")
+    #sys.exit(1)
+
+
+def read_backup():
+    # Function to read load balancer backup data
+    filepath = denv["backup"]
+    if os.path.isfile(filepath):
+        wait_lock()
+        with open(filepath, "r") as f:
+            return json.load(f)
+    else:
+        return {}
+
+
+def get_mode(protocol):
+    return "http" if protocol =="https" else protocol
+
+
+def get_haproxy_name(frontend):
+    f_protocol, f_dnsloc, f_port, f_path, f_url = extract_url_components(frontend)
+    filename = f"{f_protocol}__{f_dnsloc}__{f_port}"
+    if not (f_path is None or f_path == "" or f_path == "/" or f_path=="//"):
+        f_path = f_path[1:] if f_path[0] == "/" else f_path
+        f_path = f_path[:-1] if f_path[-1] == "/" else f_path
+        filename += f"__{f_path.replace('/', '_')}"
+    return filename
+
+
+def get_haproxy_cfg_filename(frontend):
+    filename = get_haproxy_name(frontend)
+    filename += ".cfg"
+    return filename
+
+
+def get_haproxy_cfg_filepath(frontend):
+    filename = get_haproxy_cfg_filename(frontend)
+    filepath = os.path.join(denv["lb_etc"], "haproxy.d", filename)
+    return filepath 
+
+
+def remove_haproxy_cfg_file(frontend):
+    filename = get_haproxy_cfg_filename(frontend)
+    if os.path.isfile(filename):
+        os.remove(filename)
+
+
+def get_haproxy_cfg_filepath(frontend):
+    filename = get_haproxy_cfg_filename(frontend)
+    filepath = os.path.join(denv["lb_etc"], "haproxy.d", filename)
+    return filepath
+
+
+def replace_haproxy_cfg_file(frontend):
+    remove_haproxy_cfg_file(frontend)
+
+    # create frontend-in string
+    f_protocol, f_dnsloc, f_port, f_path, f_url = extract_url_components(frontend)
+    f_mode = get_mode(f_protocol)
+    f_name = get_haproxy_name(frontend)
+
+    msg = f"ssl crt /etc/ssl/{get_certpath(frontend)}" if f_protocol == "https" else ""
+
+    mystr = f"frontend {f_name}-in\n"
+    mystr += f"    mode {f_mode}\n"
+    mystr += f"    bind *:{f_port} {msg}\n\n"
+
+    mystr += f"    acl host__{f_name} hdr (host) -i {f_dnsloc}\n"
+
+    d = read_backup()
+    if "redirect" in d[f_url]:
+        # redirect when needed
+        temp = "" if d[f_url]["redirect"] == "443" else " !{ dst_port " + d[f_port]["redirect"] + " }\n\n"
+        mystr += f"    redirect scheme https code 301 if host__{f_name} !" + "{ ssl_fc } " + f"{temp}\n"
+    else:
+        # redirect path when needed
+        if not (f_path is None or f_path == "" or f_path == "/" or f_path == "//"):
+            f_path = f_path[1:] if f_path[0] == "/" else f_path
+            f_path = f_path[:-1] if f_path[-1] == "/" else f_path
+            mystr += f"    is_{f_name}_path path_beg /{f_path}\n"
+            mystr += f"    use_backend {f_name}-backend if host__{f_name} && is_{f_name}_path\n\n"
+        else:
+            mystr += f"    use_backend {f_name}-backend if host__{f_name}\n\n"
+        
+        # add backends
+        mystr += f"{f_name}-backend\n"
+        mystr += f"    mode {f_mode}\n"
+        mystr += "    balance leastconn\n"
+        for n in range(len(d[f_url]["backends"])):
+            b_url = d[f_url]["backends"][n]
+            b_protocol, b_dnsloc, b_port, _, b_url = extract_url_components(b_url)
+            b_mode = get_mode(b_protocol)
+            if b_mode != f_mode:
+                logging.info("mixed modes, could not create haproxy config file")
+                sys.exit(1)
+
+            b_name = get_haproxy_name(b_url) + str(n + 1)
+            if b_protocol == "https":
+                mystr += f"    server {b_name} {b_dnsloc}:{b_port} ssl verify none check\n"
+            else:
+                mystr += f"    server {b_name} {b_dnsloc}:{b_port} check\n"
+            
+    filepath = get_haproxy_cfg_filename(frontend)
+    with open(filepath, "w") as f:
+        f.write(mystr)
+
+
+def save_backup(frontend, d):
+    # Function to save load balancer backup data
+    backup_filepath = denv["backup"]
+    mykey = lock()
+    with open(backup_filepath, "w") as f:
+        f.write(json.dumps(d))
+
+    replace_haproxy_cfg_file(frontend)    
+    unlock(mykey)
+
+
+def list_backend(frontend):
+    # Function to list all backends to specified load balanced frontend
+    _, _, f_port, _, f_url = extract_url_components(frontend)
+    d = read_backup()
+    if f_url in d:
+        if "redirect" in d[f_url]:
+            print(f"Port Redirect: from {f_port} to {d[f_url]['redirect']}")
+        else:
+            print("Port Redirect: None")
+        
+        certpath = get_certpath(frontend)
+        if os.path.isfile(certpath):
+            days_left = get_days_until_cert_expiration(certpath)
+            if days_left < 1:
+                print("SSL: Expired")
+            else:
+                print("SSL: {days_left} days left")
+        else:
+            print("SSL: None")
+        
+        if len(d[f_url]["backends"]) == 0:
+            print("Backends: None")
+        else:
+            print("Backends:")
+            for listitem in d[f_url]["backends"]:
+                print(listitem)
+
+
+def list_frontend():
+    # Function to list all load balanced frontends
+    d = read_backup()
+    for listitem in sorted(d.keys()):
+        print(listitem)
+
+
+def get_haproxy_name(frontend):
+    f_protocol, f_port, f_dnsloc, f_path, _ = extract_url_components(frontend)
+    haproxy_name = f"{f_protocol}__{f_dnsloc}__{f_port}"
+    if not (f_path is None or f_path == "" or f_path == "/"):
+        if f_path[0] == "/":
+            f_path = f_path[1:]
+        if f_path[-1] == "/":
+            f_path = f_path[:-1]
+        haproxy_name = f"{haproxy_name}_{f_path.replace('/', '_')}"
+    return haproxy_name
+
+
+def add_backend(frontend, backend):
+    # Function to add a backend to load balanced frontend
+    f_protocol, _, _, _, f_url = extract_url_components(frontend)
+    f_mode = get_mode(f_protocol)
+    
+    b_protocol, _, _, _, b_url = extract_url_components(backend)
+    b_mode = get_mode(b_protocol)
+    
+    if f_mode != b_mode:
+        logging.info("protocol mismatch")
+        sys.exit(1)
+
+    d = read_backup()
+
+    if f_url in d:
+        # do not add if redirect
+        if "redirect" in d[f_url]:
+            logging.info(f"frontend {f_url} is redirected to " + d[f_url]["redirect"] + f", therefore cannot add backend to {f_url}")
+            sys.exit(1)
+        
+        first_b_url = d[f_url]["backends"][0]
+        first_b_protocol, _, _, _, _ = extract_url_components(first_b_url)
+        first_b_mode = get_mode(first_b_protocol)
+        if b_mode != first_b_mode:
+            logging.info("cannot mix protocols in backed")
+            sys.exit(1)
+    else:
+        d[f_url] = {}
+        d[f_url]["backends"] = []
+    
+    if b_url not in d[f_url]["backends"]:
+        d[f_url]["backends"].append(b_url)
+    
+    save_backup(frontend, d)
+
+
+def remove_backend(frontend, backend):
+    # Function to remove a backend from load balanced frontend
+    _, _, _, _, f_url = extract_url_components(frontend)
+    _, _, _, _, b_url = extract_url_components(backend)
+    
+    d = read_backup()
+    has_changed = False
+
+    if f_url in d:
+        # cannot remove from redirected
+        if "redirect" in d[f_url]:
+            logging.info("cannot remove from redirected url")
+            sys.exit(1)
+    
+        if b_url in d[f_url]["backends"]:
+            has_changed = True
+            d[f_url]["backends"].remove(b_url)
+            if len(d[f_url]["backends"]) == 0 and "redirect" not in d[f_url]:
+                del d[f_url]
+    
+    if has_changed:
+        save_backup(frontend, d)
+
+
+def remove_frontend(frontend):
+    # Function to remove the frontend from load balancer
+    _, _, _, _, f_url = extract_url_components(frontend)
+
+    d = read_backup()
+    has_changed = False
+    
+    if f_url in d:
+        has_changed = True
+        del d[f_url]
+    
+    if has_changed:
+        save_backup(frontend, d)
+
+
+def get_days_until_cert_expiration(cert_file):
+    with open(cert_file) as f:
+        cert_data = f.read().encode('utf-8')
+    
+    cert = ssl.PEM_cert_to_DER_cert(cert_data)
+    x509 = ssl.DER_cert_to_X509(cert)
+    not_after = x509.get_notAfter().decode('utf-8')
+    expire_date = datetime.datetime.strptime(not_after, '%Y%m%d%H%M%SZ')
+    time_left = expire_date - datetime.datetime.utcnow()
+    return time_left.days
+
+
+def get_certpath(frontend):
+    _, dnsloc, _, _, _ = extract_url_components(frontend)
+    certpath = os.path.join(denv["lb_etc"], "certs", dnsloc + "_combined.pem")
+    return certpath
+
+
+def ssl(frontend, email):
+    # Function to update Letsencrypt SLL certificate
+    if not is_valid_email(email):
+        logging.info("invalid email")
+        sys.exit(1)
+    
+    f_protocol, f_dnsloc, _, _, _ = extract_url_components(frontend)
+    
+    if f_protocol not in ["http", "https"]:
+        logging.info("invalid protocol for SSL")
+        sys.exit(1)
+    
+    certpath = get_certpath(frontend)
+
+    def create_cert():
+        os.system(f"certbot certonly --standalone -d {f_dnsloc} --non-interactive --agree-tos --email {email}")
+        os.system(f"cat /etc/letsencrypt/live/{f_dnsloc}/cert.pem /etc/letsencrypt/live/{f_dnsloc}/privkey.pem > {certpath}")
+    
+    def remove_cert():
+        os.remove(certpath)
+        shutil.rmtree(f"/etc/letsencrypt/{f_dnsloc}")
+
+    if not os.path.isfile(certpath):
+        create_cert()
+        logging.info(f"created certificate for {f_dnsloc}")
+    else:
+        days_left = get_days_until_cert_expiration(certpath)
+        if int(days_left) < 15:
+            remove_cert()
+            create_cert()
+            logging.info(f"updated cetificate for {f_dnsloc}")
+
+
+def port_redirect(frontend, to_port):
+    # Function to redirec from_port to to_port for loadbalanced frontend
+    f_protocol, f_dnsloc, f_port, f_path, f_url = extract_url_components(frontend)
+
+    d = read_backup()
+
+    if f_url not in d:
+        logging.info("cannot redirect when frontend is missing")
+        sys.exit(1)
+    
+    if f_protocol != "http":
+        logging.info("currently only supporting redirect from http to https")
+        sys.exit(1)
+    
+    if "redirect" in d[f_url]:
+        logging.info(f"already redirecting {f_url}")
+        sys.exit(1)
+    
+    if f_port == to_port:
+        logging.info("http and https should be on different ports")
+        sys.exit(1)
+    
+    d[f_url]["redirect"] = to_port
+    if f_path is None or f_path == "/":
+        f_path = ""
+
+    https_url = f"https://{f_dnsloc}:{to_port}/{f_path}/"
+    if https_url not in d:
+        d[https_url] = {}
+        d[https_url]["backends"] = []
+
+    for b_url in d[f_url]["backends"]:
+        if b_url not in d[https_url]["backends"]:
+            d[https_url]["backends"].append(b_url)
+    
+    del d[f_url]["backends"]
+    logging.info("redirecting http to https")
+    save_backup(frontend, d)
+
+
+def get_haproxy_cfg_filename(frontend):
+    f_protocol, f_dnsloc, f_port, f_path, _ = extract_url_components(frontend)
+    filename = f"{f_protocol}__{f_dnsloc}__{f_port}"
+    if f_path is not None and f_path != "" and f_path != "/":
+        filename = filename + f"__{f_path}"
+    return filename + ".cfg"
+
+
+def restart():
+    # Function to restart the load balancer
+    wait_lock()
+    os.system("/etc/init.d/rsyslog restart")
+    os.system("/etc/init.d/haproxy restart")
+
+
+def getEnv():
+    # Loads environment variables
+    load_dotenv()
+    denv = {}
+
+    denv["env"] = os.environ.get("ENVIRONMENT", "dev")
+    if denv["env"] not in ["dev", "test", "prod"]:
+        denv["env"] = "dev"
+
+    denv["root"] = os.environ.get("ROOT_DIR", "/opt/mhproxy/")
+    denv["bin"] = os.path.join(denv["root"], os.environ.get("RELATIVE_BIN_DIR", "bin/"))
+    denv["var"] = os.path.join(denv["root"], os.environ.get("RELATIVE_DATA_DIR", "var/"))
+    denv["lib"] = os.path.join(denv["root"], os.environ.get("RELATIVE_LIB_DIR", "lib/"))
+
+    denv["sleep"] = float(os.environ.get("TIME_SLEEP", "0.1"))
+    denv["retries"] = int(os.environ.get("MAX_RETRIES", "100"))
+    denv["backup"] = os.path.join(denv["var"], os.environ.get("BACKUP", "data.json"))
+
+    denv["lb_etc"] = os.environ.get("LB_ETC", "/etc/haproxy/")
+    denv["ssl_etc"] = os.environ.get("LB_ETC", "/etc/letsencrypt/")
+
+    return denv
+
+
+denv = getEnv()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MHProxy - A HAProxy and Let's Encrypt configuration tool.")
+    parser.add_argument("-v", "--version", action="version", version="%(prog)s version 0.1")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    parser_list = subparsers.add_parser("list", help="list the whole load balanced frontend")
+    parser_list.add_argument("-f", "--frontend", help="list all backends to specified FRONTEND")
+
+    parser_add = subparsers.add_parser("add", help="add specified backend to load balanced frontend")
+    parser_add.add_argument("-f", "--frontend", help="specify the FRONTEND url", required=True)
+    parser_add.add_argument("-b", "--backend", help="specify the BACKEND url", required=True)
+
+    parser_remove = subparsers.add_parser("remove", help="remove backend or frontend from the load balancer")
+    parser_remove.add_argument("-f", "--frontend", help="remove whole specified FRONTEND from the load balancer", required=True)
+    parser_remove.add_argument("-b", "--backend", help="remove only the specified BACKEND from the load balanced FRONTEND")
+
+    parser_ssl = subparsers.add_parser("ssl", help="update and backup SSL certificate")
+    parser_ssl.add_argument("-f", "--frontend", help="specify FRONTEND for SSL certificate update", required=True)
+    parser_ssl.add_argument("--email", help="specify your Let's Encrypt registered EMAIL to update SSL certificate",required=True)
+
+    parser_redirect = subparsers.add_parser("redirect", help="redirect traffic from one port to another port")
+    parser_redirect.add_argument("-f", "--frontend", help="redirect traffic for load balanced FRONTEND", required=True)
+    parser_redirect.add_argument("-p", "--to-port", help="redirect traffic to specified TO_PORT", required=True)
+
+    subparsers.add_parser("unlock", help="removes the lock file")
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        if args.frontend:
+            list_backend(args.frontend)
+        else:
+            list_frontend()
+
+    elif args.command == "add":
+        if args.frontend and args.backend:
+            add_backend(args.frontend, args.backend)
+        else:
+            print("Error: Arguments missing! For more help, type: mhproxy add -h.")
+
+    elif args.command == "remove":
+        if args.frontend and args.backend:
+            remove_backend(args.frontend, args.backend)
+        elif args.frontend:
+            remove_frontend(args.frontend)
+        else:
+            print("Error: Arguments missing! For more help, type: mhproxy remove -h.")
+
+    elif args.command == "ssl":
+        if args.frontend and args.email:
+            ssl(args.frontend, args.email)
+        else:
+            print("Error: Arguments missing! For more help, type: mhproxy ssl -h.")
+
+    elif args.command == "redirect":
+        if args.frontend and args.to_port:
+            port_redirect(args.frontend, args.to_port)
+        else:
+            print("Error: Arguments missing! For more help, type: mhproxy redirect -h.")
+
+    elif args.command == "unlock":
+        force_unlock()
+
+    elif args.command == "restart":
+        restart()
+
+
+if __name__ == "__main__":
+    main()
